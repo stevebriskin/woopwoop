@@ -11,6 +11,7 @@ import (
 
 	"github.com/GoogleCloudPlatform/functions-framework-go/functions"
 	"github.com/edaniels/golog"
+	"go.uber.org/multierr"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"go.viam.com/rdk/components/board"
@@ -91,6 +92,8 @@ func init() {
 func woop(w http.ResponseWriter, r *http.Request) {
 	if len(r.URL.Query()) == 0 {
 		doGCPAlert(w, r)
+	} else if r.URL.Query().Get("v") == "3" {
+		doV3(w, r)
 	} else {
 		doBasicQueryParam(w, r)
 	}
@@ -222,6 +225,127 @@ func doBasicQueryParam(w http.ResponseWriter, r *http.Request) {
 		logger.Error("Couldn't set pin value", err)
 		w.WriteHeader(http.StatusRequestTimeout)
 		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func doV3(w http.ResponseWriter, r *http.Request) {
+	api_key := os.Getenv("api_key")
+	api_key_id := os.Getenv("api_key_id")
+	uri_suffix := os.Getenv("uri_suffix")
+	secret := os.Getenv("secret")
+	logger := makeLogger("client")
+
+	// not good, but good enough for current usage
+	passed_secret := r.URL.Query().Get("secret")
+
+	if secret != passed_secret {
+		logger.Error("Wrong secret")
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	// don't want to commit full URIs...the suffix with the location is an env variable
+	woop_num := r.URL.Query().Get("woop")
+	robot_uri_full := fmt.Sprintf("woopwoop%s-main.%s", woop_num, uri_suffix)
+
+	logger.Info("Connecting to ", robot_uri_full)
+	ctx := context.Background()
+	robot, err := RobotClient(ctx, robot_uri_full, api_key, api_key_id, logger, 5)
+	if err != nil {
+		logger.Error("Failed to connect to robot.", err)
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	defer robot.Close(ctx)
+
+	esp, err := board.FromRobot(robot, "board")
+	if err != nil {
+		logger.Error("No board found.", err)
+		w.WriteHeader(http.StatusExpectationFailed)
+		return
+	}
+	defer esp.Close(ctx)
+
+	redPin, err := esp.GPIOPinByName("19")
+	if err != nil {
+		logger.Error("Red gpio pin 19 not found.", err)
+		w.WriteHeader(http.StatusExpectationFailed)
+		return
+	}
+
+	greenPin, err := esp.GPIOPinByName("18")
+	if err != nil {
+		logger.Error("Green gpio pin 18 not found.", err)
+		w.WriteHeader(http.StatusExpectationFailed)
+		return
+	}
+
+	bluePin, err := esp.GPIOPinByName("21")
+	if err != nil {
+		logger.Error("Blue gpio pin 21 not found.", err)
+		w.WriteHeader(http.StatusExpectationFailed)
+		return
+	}
+
+	buzzerPin, err := esp.GPIOPinByName("5")
+	if err != nil {
+		logger.Error("Buzzer gpio pin 14 not found.", err)
+		w.WriteHeader(http.StatusExpectationFailed)
+		return
+	}
+
+	var request map[string]any
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		logger.Error("failed to decode body.", err)
+		return
+	}
+	logger.Info("Received Body:", request)
+
+	redraw, rok := request["red"]
+	greenraw, gok := request["green"]
+	blueraw, bok := request["blue"]
+	buzzerraw, buzzok := request["buzzer"]
+
+	if rok {
+		red := redraw.(map[string]any)
+		err = multierr.Combine(redPin.SetPWMFreq(ctx, uint(red["freq"].(float64)), nil), redPin.SetPWM(ctx, red["duty"].(float64), nil))
+		if err != nil {
+			logger.Error("Couldn't set red pin value", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	if gok {
+		green := greenraw.(map[string]any)
+		err = multierr.Combine(greenPin.SetPWMFreq(ctx, uint(green["freq"].(float64)), nil), greenPin.SetPWM(ctx, green["duty"].(float64), nil))
+		if err != nil {
+			logger.Error("Couldn't set green pin value", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	if bok {
+		blue := blueraw.(map[string]any)
+		err = multierr.Combine(bluePin.SetPWMFreq(ctx, uint(blue["freq"].(float64)), nil), bluePin.SetPWM(ctx, blue["duty"].(float64), nil))
+		if err != nil {
+			logger.Error("Couldn't set blue pin value", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+
+	if buzzok {
+		buzzer := buzzerraw.(bool)
+		err = buzzerPin.Set(ctx, buzzer, nil)
+		if err != nil {
+			logger.Error("Couldn't set pin value", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusOK)
